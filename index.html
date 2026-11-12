@@ -59,6 +59,7 @@
   const T_OPEN    = 3.4;   // time for the hole to eat the whole wall
   const T_BLANK   = 0.8;   // empty page before the first 0 appears
   const T_BREATH  = 11.0;  // one full expand/collapse breath
+  const T_LINGER  = 3.5;   // hold "000" in the center after each breath
   const RIM_BAND  = 3.2;   // width (in cells) of the jittering rim ahead of the hole
 
   const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -70,7 +71,8 @@
   let fontSize = 16, cellW = 10, cellH = 16;
   let cols = 0, rows = 0, offX = 0, offY = 0;
   let cx = 0, cy = 0;         // pixel center (center of the center cell)
-  let cells = [];              // { x, y, d, shed, seed }
+  let cells = [];              // { x, y, d, shed, seed, center }
+  let center3 = [];            // the three cells that spell 000
   let maxD = 0;                // farthest cell distance from center (px)
 
   let start = performance.now();
@@ -119,6 +121,7 @@
     cy = offY + (ri + 0.5) * cellH;
 
     cells = [];
+    center3 = [];
     maxD = 0;
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
@@ -126,7 +129,10 @@
         const y = offY + (r + 0.5) * cellH;
         const d = Math.hypot(x - cx, y - cy);
         const seed = r * 1031 + c * 7;
-        cells.push({ x, y, d, seed, shed: hash(seed) });
+        const center = r === ri && Math.abs(c - ci) <= 1;
+        const k = { x, y, d, seed, shed: hash(seed), center };
+        cells.push(k);
+        if (center) center3.push(k);
         if (d > maxD) maxD = d;
       }
     }
@@ -176,6 +182,7 @@
 
     for (let i = 0; i < cells.length; i++) {
       const k = cells[i];
+      if (k.center) continue;                         // drawn solid below
       if (k.d > r) continue;
       const u = k.d / Math.max(r, 1);                 // 0 at center, 1 at the edge
       const ring = Math.floor(k.d / cellH);
@@ -192,6 +199,14 @@
       ctx.fillText(g, k.x, k.y);
     }
     ctx.globalAlpha = 1;
+    draw000();
+  }
+
+  // "000" in the center: full black, no fade.
+  function draw000() {
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = INK;
+    for (let i = 0; i < center3.length; i++) ctx.fillText('0', center3[i].x, center3[i].y);
   }
 
   let frame = 0;
@@ -209,7 +224,13 @@
     } else if (elapsed < T_HOLD + T_OPEN + T_BLANK) {
       clear();
     } else {
-      drawBreath(elapsed - (T_HOLD + T_OPEN + T_BLANK));
+      const t = (elapsed - (T_HOLD + T_OPEN + T_BLANK)) % (T_BREATH + T_LINGER);
+      if (t < T_BREATH) {
+        drawBreath(t);
+      } else {
+        clear();
+        draw000();
+      }
     }
     requestAnimationFrame(render);
   }
@@ -229,8 +250,9 @@
   }
 
   function drawStatic() {
-    // Reduced motion: a still frame of the breath at mid-expansion.
-    drawBreath(T_BREATH * 0.25);
+    // Reduced motion: just the solid 000.
+    clear();
+    draw000();
   }
 
   layout();
