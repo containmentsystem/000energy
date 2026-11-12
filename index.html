@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="theme-color" content="#ffffff">
+<meta name="color-scheme" content="light">
+<title>000</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #fff;
+    color: #000;
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  body {
+    /* dynamic viewport height so iOS/Android browser chrome doesn't break the layout */
+    height: 100vh;
+    height: 100dvh;
+    width: 100vw;
+    position: fixed;
+    inset: 0;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+  noscript {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    font: 48px/1 ui-monospace, Menlo, Consolas, monospace;
+  }
+</style>
+</head>
+<body>
+<canvas id="void" aria-label="A void made of zeros" role="img"></canvas>
+<noscript>0</noscript>
+<script>
+(() => {
+  'use strict';
+
+  const FONT = 'ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace';
+  const INK = '#000';
+  const PAPER = '#fff';
+
+  // Timeline (seconds)
+  const T_HOLD    = 0.7;   // show the full wall before the hole opens
+  const T_OPEN    = 3.4;   // time for the hole to eat the whole wall
+  const T_BLANK   = 0.8;   // empty page before the first 0 appears
+  const T_BREATH  = 11.0;  // one full expand/collapse breath
+  const RIM_BAND  = 3.2;   // width (in cells) of the jittering rim ahead of the hole
+
+  const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  const canvas = document.getElementById('void');
+  const ctx = canvas.getContext('2d', { alpha: false });
+
+  let W = 0, H = 0, DPR = 1;
+  let fontSize = 16, cellW = 10, cellH = 16;
+  let cols = 0, rows = 0, offX = 0, offY = 0;
+  let cx = 0, cy = 0;         // pixel center (center of the center cell)
+  let cells = [];              // { x, y, d, shed, seed }
+  let maxD = 0;                // farthest cell distance from center (px)
+
+  let start = performance.now();
+  let last = start;
+  let elapsed = 0;             // seconds, pause-safe
+
+  function hash(n) {
+    // small integer hash -> [0,1)
+    n = (n ^ 61) ^ (n >>> 16);
+    n = (n + (n << 3)) | 0;
+    n = n ^ (n >>> 4);
+    n = (n * 0x27d4eb2d) | 0;
+    n = n ^ (n >>> 15);
+    return ((n >>> 0) % 100000) / 100000;
+  }
+
+  function layout() {
+    const vv = window.visualViewport;
+    W = Math.round(vv ? vv.width : window.innerWidth);
+    H = Math.round(vv ? vv.height : window.innerHeight);
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    // Glyph size scales with the short side so phones and desktops both read well.
+    const minDim = Math.min(W, H);
+    fontSize = Math.max(12, Math.min(22, Math.round(minDim / 26)));
+    ctx.font = fontSize + 'px ' + FONT;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    cellW = ctx.measureText('0').width;
+    cellH = fontSize * 1.05;
+
+    // Odd counts so there is a true center cell. Overfill by a cell on each side.
+    cols = Math.ceil(W / cellW) + 2; if (cols % 2 === 0) cols++;
+    rows = Math.ceil(H / cellH) + 2; if (rows % 2 === 0) rows++;
+    offX = (W - cols * cellW) / 2;
+    offY = (H - rows * cellH) / 2;
+
+    const ci = (cols - 1) / 2, ri = (rows - 1) / 2;
+    cx = offX + (ci + 0.5) * cellW;
+    cy = offY + (ri + 0.5) * cellH;
+
+    cells = [];
+    maxD = 0;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const x = offX + (c + 0.5) * cellW;
+        const y = offY + (r + 0.5) * cellH;
+        const d = Math.hypot(x - cx, y - cy);
+        const seed = r * 1031 + c * 7;
+        cells.push({ x, y, d, seed, shed: hash(seed) });
+        if (d > maxD) maxD = d;
+      }
+    }
+  }
+
+  function easeInOut(t) {
+    return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+  }
+
+  const clear = () => {
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = INK;
+    ctx.font = fontSize + 'px ' + FONT;
+  };
+
+  // Phase 1: a wall of zeros with a hole opening from the center outward.
+  function drawWall(holeR, frame) {
+    clear();
+    const band = RIM_BAND * cellH;
+    for (let i = 0; i < cells.length; i++) {
+      const k = cells[i];
+      const gap = k.d - holeR;             // distance ahead of the hole edge
+      if (gap <= 0) continue;              // eaten
+      if (gap < band) {
+        // rim: some cells shed early, the rest jitter in weight and position
+        if (gap < band * k.shed * 0.9) continue;
+        const n = hash(k.seed + ((frame / 3) | 0) * 97);
+        const g = n < 0.25 ? '.' : n < 0.55 ? 'o' : '0';
+        const j = (1 - gap / band) * 1.5;
+        ctx.fillText(g, k.x + (n - 0.5) * j * 2, k.y + (hash(k.seed * 3 + frame) - 0.5) * j * 2);
+      } else {
+        ctx.fillText('0', k.x, k.y);
+      }
+    }
+  }
+
+  // Phase 2: a single zero breathing into concentric rings and back.
+  function drawBreath(t) {
+    clear();
+    const minDim = Math.min(W, H);
+    const rMin = cellH * 0.5;                        // center cell only
+    const rMax = minDim * 0.44;
+    const p = (1 - Math.cos((2 * Math.PI * t) / T_BREATH)) / 2;   // 0 -> 1 -> 0
+    const r = rMin + (rMax - rMin) * p;
+    const ripple = t * 1.2;                           // slow outward ripple of ring weights
+
+    for (let i = 0; i < cells.length; i++) {
+      const k = cells[i];
+      if (k.d > r) continue;
+      const u = k.d / Math.max(r, 1);                 // 0 at center, 1 at the edge
+      const ring = Math.floor(k.d / cellH);
+      const w = u + 0.17 * Math.sin(ring * 1.25 - ripple); // moving concentric banding
+      let g;
+      if (k.d < cellH * 0.6)      g = '0';            // the center zero is always a true 0
+      else if (w > 0.86)          g = '.';
+      else if (w > 0.62)          g = 'o';
+      else if (w > 0.30)          g = '0';
+      else                        g = 'O';
+      // feather the outermost ring so it grows without popping
+      const edge = (r - k.d) / cellH;
+      ctx.globalAlpha = edge < 1 ? Math.max(0.15, edge) : 1;
+      ctx.fillText(g, k.x, k.y);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  let frame = 0;
+  function render(now) {
+    const dt = Math.min(0.1, (now - last) / 1000);    // clamp so a backgrounded tab doesn't jump
+    last = now;
+    elapsed += dt;
+    frame++;
+
+    if (elapsed < T_HOLD) {
+      drawWall(0, frame);
+    } else if (elapsed < T_HOLD + T_OPEN) {
+      const t = easeInOut((elapsed - T_HOLD) / T_OPEN);
+      drawWall(t * (maxD + RIM_BAND * cellH), frame);
+    } else if (elapsed < T_HOLD + T_OPEN + T_BLANK) {
+      clear();
+    } else {
+      drawBreath(elapsed - (T_HOLD + T_OPEN + T_BLANK));
+    }
+    requestAnimationFrame(render);
+  }
+
+  function restart() {
+    elapsed = 0;
+    last = performance.now();
+  }
+
+  let resizeTimer = 0;
+  function onResize() {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      layout();
+      if (reduceMotion) drawStatic();
+    }, 60);
+  }
+
+  function drawStatic() {
+    // Reduced motion: a still frame of the breath at mid-expansion.
+    drawBreath(T_BREATH * 0.25);
+  }
+
+  layout();
+  window.addEventListener('resize', onResize);
+  window.addEventListener('orientationchange', onResize);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', onResize);
+
+  if (reduceMotion) {
+    drawStatic();
+  } else {
+    canvas.addEventListener('pointerdown', restart);
+    requestAnimationFrame((now) => { last = now; render(now); });
+  }
+})();
+</script>
+</body>
+</html>
