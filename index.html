@@ -60,8 +60,9 @@
   const T_BLANK   = 0.8;   // empty page before 000 appears
   const T_BREATH  = 11.0;  // one full expand/collapse breath
   const T_LINGER  = 3.5;   // hold "000" in the center after each breath
-  const RIM_BAND  = 3.2;   // width (in cells) of the eroding rim ahead of the hole
-  const EDGE_BAND = 1.6;   // width (in cells) over which ring glyphs grow in / shrink out
+  const RIM_BAND  = 3.0;   // width (in cells) of the blinking rim ahead of the hole
+  const EDGE_BAND = 2.2;   // width (in cells) over which ring glyphs blink in / out
+  const BLINK_HZ  = 15;    // how fast an edge cell can toggle
 
   const GLYPHS = ['.', 'o', '0', 'O'];
 
@@ -116,10 +117,18 @@
     }
   }
 
-  // Draw a glyph centered at (x, y), scaled by s (1 = normal size).
-  function glyph(g, x, y, s) {
-    const w = spriteW * s, h = spriteH * s;
-    ctx.drawImage(sprites[g], x - w / 2, y - h / 2, w, h);
+  // Draw a glyph centered at (x, y) at native size. Glyphs are either on or off.
+  function glyph(g, x, y) {
+    ctx.drawImage(sprites[g], x - spriteW / 2, y - spriteH / 2, spriteW, spriteH);
+  }
+
+  // Binary blink: a cell with "on" probability pOn is drawn on this tick or not.
+  // Each cell has its own phase so the whole edge never toggles in lockstep.
+  function lit(k, t, pOn) {
+    if (pOn >= 1) return true;
+    if (pOn <= 0) return false;
+    const tick = Math.floor(t * BLINK_HZ + k.phase * 7);
+    return hash(k.seed + tick * 131) < pOn;
   }
 
   function layout() {
@@ -164,7 +173,7 @@
         const d = Math.hypot(x - cx, y - cy);
         const seed = r * 1031 + c * 7;
         const center = r === ri && Math.abs(c - ci) <= 1;
-        const k = { x, y, d, seed, shed: hash(seed), dither: hash(seed * 13 + 5) - 0.5, center };
+        const k = { x, y, d, seed, phase: hash(seed * 7 + 3), dither: hash(seed * 13 + 5) - 0.5, center };
         cells.push(k);
         if (center) center3.push(k);
         if (d > maxD) maxD = d;
@@ -178,13 +187,13 @@
   }
 
   // "000" in the center: full black, no fade.
-  function draw000(s = 1) {
-    for (let i = 0; i < center3.length; i++) glyph('0', center3[i].x, center3[i].y, s);
+  function draw000() {
+    for (let i = 0; i < center3.length; i++) glyph('0', center3[i].x, center3[i].y);
   }
 
   // Phase 1: a wall of zeros with a hole opening from the center outward.
-  // Cells shrink and lighten as the edge reaches them, as if pulled in.
-  function drawWall(holeR, frame) {
+  // Cells ahead of the edge blink out with rising probability until they're gone.
+  function drawWall(holeR, t) {
     clear();
     const band = RIM_BAND * cellH;
     for (let i = 0; i < cells.length; i++) {
@@ -193,14 +202,12 @@
       if (gap <= 0) continue;              // eaten
       if (gap < band) {
         const u = gap / band;              // 1 = untouched, 0 = at the edge
-        if (u < k.shed * 0.6) continue;    // some cells shed early for an eroded rim
-        const n = hash(k.seed + ((frame / 4) | 0) * 97);
-        const g = u < 0.35 ? (n < 0.5 ? '.' : 'o') : u < 0.7 ? (n < 0.3 ? 'o' : '0') : '0';
-        const j = (1 - u) * 1.2;
-        const s = 0.35 + 0.65 * smooth(u);
-        glyph(g, k.x + (n - 0.5) * j * 2, k.y + (hash(k.seed * 3 + ((frame / 2) | 0)) - 0.5) * j * 2, s);
+        if (!lit(k, t, smooth(u * 1.15))) continue;
+        const n = hash(k.seed + Math.floor(t * 8) * 97);
+        const g = u < 0.3 ? (n < 0.5 ? '.' : 'o') : u < 0.6 ? (n < 0.35 ? 'o' : '0') : '0';
+        glyph(g, k.x, k.y);
       } else {
-        glyph('0', k.x, k.y, 1);
+        glyph('0', k.x, k.y);
       }
     }
   }
@@ -211,54 +218,56 @@
     const minDim = Math.min(W, H);
     const rMin = cellH * 0.5;
     const rMax = minDim * 0.44;
-    const p = (1 - Math.cos((2 * Math.PI * t) / T_BREATH)) / 2;   // 0 -> 1 -> 0
+    // Even cadence: mostly linear in radius so cells appear at a steady rate,
+    // with a little rounding at the turnarounds so it doesn't bounce.
+    const f = t / T_BREATH;
+    const tri = 1 - Math.abs(2 * f - 1);
+    const cos = (1 - Math.cos(2 * Math.PI * f)) / 2;
+    const p = 0.6 * tri + 0.4 * cos;
     const r = rMin + (rMax - rMin) * p;
-    const ripple = t * 0.9;                           // slow outward ripple of ring weights
+    const ripple = t * 0.8;                           // slow outward ripple of ring weights
     const edgeBand = EDGE_BAND * cellH;
 
     for (let i = 0; i < cells.length; i++) {
       const k = cells[i];
       if (k.center) continue;                         // drawn solid below
-      if (k.d > r) continue;
+      const m = (r - k.d) / edgeBand;                 // >1 solid, <0 off, between: blinking
+      if (m <= -0.15) continue;
+      if (!lit(k, t, smooth(m + 0.15))) continue;
       const u = k.d / Math.max(r, 1);                 // 0 at center, 1 at the edge
       const ring = k.d / cellH;
-      // Per-cell dither moves each cell's glyph threshold a little, so a ring
-      // changes weight cell by cell over time instead of all at once.
       const w = u + 0.17 * Math.sin(ring * 1.25 - ripple) + k.dither * 0.07;
       const g = w > 0.86 ? '.' : w > 0.62 ? 'o' : w > 0.30 ? '0' : 'O';
-      // Glyphs grow in from small as the edge passes them, and shrink out on the
-      // way back. Opaque throughout; only size changes.
-      const s = 0.2 + 0.8 * smooth((r - k.d) / edgeBand);
-      glyph(g, k.x, k.y, s);
+      glyph(g, k.x, k.y);
     }
-    draw000(1);
+    draw000();
   }
 
-  let frame = 0;
   function render(now) {
     const dt = Math.min(0.1, (now - last) / 1000);    // clamp so a backgrounded tab doesn't jump
     last = now;
     elapsed += dt;
-    frame++;
 
     const tIntro = T_HOLD + T_OPEN + T_BLANK;
     if (elapsed < T_HOLD) {
-      drawWall(0, frame);
+      drawWall(0, elapsed);
     } else if (elapsed < T_HOLD + T_OPEN) {
       const t = easeInOut((elapsed - T_HOLD) / T_OPEN);
-      drawWall(t * (maxD + RIM_BAND * cellH), frame);
+      drawWall(t * (maxD + RIM_BAND * cellH), elapsed);
     } else if (elapsed < tIntro) {
       clear();
     } else {
       const since = elapsed - tIntro;
       const t = since % (T_BREATH + T_LINGER);
-      if (t < T_BREATH) {
+      if (since < 0.6) {
+        // first appearance: 000 blinks in, then holds
+        clear();
+        if (hash(Math.floor(since * 16) * 977) < smooth(since / 0.6)) draw000();
+      } else if (t < T_BREATH) {
         drawBreath(t);
-        // first appearance: 000 scales up from nothing over a short beat
-        if (since < 0.45) { clear(); draw000(smooth(since / 0.45)); }
       } else {
         clear();
-        draw000(1);
+        draw000();
       }
     }
     requestAnimationFrame(render);
@@ -272,7 +281,7 @@
   function drawStatic() {
     // Reduced motion: just the solid 000.
     clear();
-    draw000(1);
+    draw000();
   }
 
   let resizeTimer = 0;
